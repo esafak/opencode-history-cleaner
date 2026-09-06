@@ -1,0 +1,28 @@
+clear_opencode_history.bat
+  h_ea91e2db23540f 3-7
+README.md
+  h_ea91e2db23540f 9-10,13,20-57,60,66,72-91
+.github/workflows/tests.yml
+  h_ea91e2db23540f 1-20
+clear_opencode_history.command
+  h_ea91e2db23540f 3-7
+.gitignore
+  h_ea91e2db23540f 1-4
+clear_opencode_history.py
+  h_ea91e2db23540f 10-18,57-71,86-115,119,137-143,240-398,401-402,404-419,421,423-425,428
+tests/test_history_cleaner.py
+  h_ea91e2db23540f 1-411
+tests/__init__.py
+  h_ea91e2db23540f 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "5e6f2ddb19337bf9cc08a79d828a3cccc2900952",
+  "prompts": {},
+  "humans": {
+    "h_ea91e2db23540f": {
+      "author": "Emre Şafak <3928300+esafak@users.noreply.github.com>"
+    }
+  }
+}
