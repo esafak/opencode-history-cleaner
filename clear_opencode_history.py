@@ -104,6 +104,11 @@ def clean_database(db_path, retain=None):
                     f"[+] Removed sessions older than {retain} "
                     "(months are 30 days)."
                 )
+            else:
+                print(
+                    "[-] Database does not contain a session table; "
+                    "retention cleanup skipped."
+                )
             # Related rows use ON DELETE CASCADE. Global events are not tied to
             # sessions, so leave them untouched during a retention cleanup.
             tables_to_clear = []

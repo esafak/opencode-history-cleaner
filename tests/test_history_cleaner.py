@@ -226,6 +226,11 @@ class IsolatedDatabaseTests(unittest.TestCase):
         cleaner.clean_database(sparse)
         self.assertTrue(os.path.exists(sparse))
 
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cleaner.clean_database(sparse, "1d")
+        self.assertIn("does not contain a session table", output.getvalue())
+
     def test_database_cleanup_retains_recent_sessions_and_cascades_old_history(self):
         now = 2_000_000
         retention_ms = 24 * 60 * 60 * 1000
