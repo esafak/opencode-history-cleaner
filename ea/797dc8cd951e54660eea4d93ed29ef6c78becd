@@ -1,0 +1,16 @@
+clear_opencode_history.py
+  h_ea91e2db23540f 107-111
+tests/test_history_cleaner.py
+  h_ea91e2db23540f 229-233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ea797dc8cd951e54660eea4d93ed29ef6c78becd",
+  "prompts": {},
+  "humans": {
+    "h_ea91e2db23540f": {
+      "author": "Emre Şafak <3928300+esafak@users.noreply.github.com>"
+    }
+  }
+}
