@@ -7,6 +7,15 @@ import sqlite3
 import time
 import subprocess
 import platform
+import argparse
+import re
+from urllib.parse import quote
+
+RETENTION_UNITS = {
+    "d": 24 * 60 * 60 * 1000,
+    "w": 7 * 24 * 60 * 60 * 1000,
+    "m": 30 * 24 * 60 * 60 * 1000,
+}
 
 def print_banner():
     print("=" * 60)
@@ -45,7 +54,21 @@ def get_paths():
         
     return app_support, db_path
 
-def clean_database(db_path):
+def parse_retention(value):
+    """Return a retention duration in milliseconds, or raise ValueError."""
+    match = re.fullmatch(r"([1-9][0-9]*)([dwm])", value.strip().lower())
+    if not match:
+        raise ValueError("retention must be a positive duration such as 30d, 4w, or 5m")
+    amount, unit = match.groups()
+    return int(amount) * RETENTION_UNITS[unit]
+
+
+def retention_cutoff(value, now=None):
+    """Return the oldest session timestamp to retain (OpenCode uses ms)."""
+    return int((time.time() if now is None else now) * 1000) - parse_retention(value)
+
+
+def clean_database(db_path, retain=None):
     if not os.path.exists(db_path):
         print(f"[-] Database not found at {db_path}")
         return
@@ -60,16 +83,45 @@ def clean_database(db_path):
         
         cursor.execute("PRAGMA foreign_keys = ON;")
         
-        tables_to_clear = [
-            "part", "message", "session_message", "session_input",
-            "session_share", "session_context_epoch", "todo", "session",
-            "event", "event_sequence"
-        ]
+        if retain:
+            cutoff = retention_cutoff(retain)
+            if _table_exists(cursor, "session"):
+                cursor.execute(
+                    """WITH RECURSIVE retained_ancestors(id) AS (
+                           SELECT id FROM session WHERE time_updated >= ?
+                           UNION
+                           SELECT s.parent_id
+                           FROM session s
+                           JOIN retained_ancestors r ON s.id = r.id
+                           WHERE s.parent_id IS NOT NULL
+                       )
+                       DELETE FROM session
+                       WHERE time_updated < ?
+                         AND id NOT IN (SELECT id FROM retained_ancestors)""",
+                    (cutoff, cutoff),
+                )
+                print(
+                    f"[+] Removed sessions older than {retain} "
+                    "(months are 30 days)."
+                )
+            else:
+                print(
+                    "[-] Database does not contain a session table; "
+                    "retention cleanup skipped."
+                )
+            # Related rows use ON DELETE CASCADE. Global events are not tied to
+            # sessions, so leave them untouched during a retention cleanup.
+            tables_to_clear = []
+        else:
+            tables_to_clear = [
+                "part", "message", "session_message", "session_input",
+                "session_share", "session_context_epoch", "todo", "session",
+                "event", "event_sequence"
+            ]
         
         for table in tables_to_clear:
             try:
-                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}';")
-                if cursor.fetchone():
+                if _table_exists(cursor, table):
                     cursor.execute(f"DELETE FROM `{table}`;")
                     print(f"[+] Cleared table: {table}")
             except Exception as e:
@@ -86,6 +138,13 @@ def clean_database(db_path):
         
     except Exception as e:
         print(f"[-] Database error: {e}")
+
+
+def _table_exists(cursor, table):
+    cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    )
+    return cursor.fetchone() is not None
 
 def clean_json_caches(app_support):
     if not os.path.exists(app_support):
@@ -183,20 +242,192 @@ def delete_diffs_and_outputs(db_dir):
                     print(f"[-] Error deleting file {file}: {e}")
         print(f"[+] Deleted {count} cache files from {os.path.basename(target_dir)}")
 
-def main():
+def format_bytes(size):
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(size)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+
+def show_stats(db_path):
+    if not os.path.exists(db_path):
+        print(f"[-] Database not found at {db_path}")
+        return
+
+    print(f"[*] Reading database statistics from {db_path}...")
+    try:
+        # URI mode=ro ensures this command cannot create, lock, or modify the DB.
+        uri = "file:" + quote(os.path.abspath(db_path)) + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "session" not in tables:
+            print("[-] Database does not contain a session table.")
+            conn.close()
+            return
+
+        project_join = "LEFT JOIN project p ON p.id = s.project_id" if "project" in tables else ""
+        project_name = (
+            "COALESCE(NULLIF(p.name, ''), p.worktree, s.project_id, '(unknown project)')"
+            if "project" in tables
+            else "COALESCE(s.project_id, '(unknown project)')"
+        )
+        message_size = (
+            "COALESCE((SELECT SUM(length(CAST(m.data AS BLOB))) "
+            "FROM message m WHERE m.session_id = s.id), 0)"
+            if "message" in tables
+            else "0"
+        )
+        part_size = (
+            "COALESCE((SELECT SUM(length(CAST(pt.data AS BLOB))) "
+            "FROM part pt WHERE pt.session_id = s.id), 0)"
+            if "part" in tables
+            else "0"
+        )
+        rows = conn.execute(
+            f"""SELECT {project_name} AS project, COUNT(*) AS sessions,
+                       SUM(
+                           length(CAST(COALESCE(s.title, '') AS BLOB)) +
+                           length(CAST(COALESCE(s.metadata, '') AS BLOB)) +
+                           length(CAST(COALESCE(s.summary_diffs, '') AS BLOB)) +
+                           {message_size} + {part_size}
+                       ) AS bytes
+                FROM session s
+                {project_join}
+                GROUP BY project
+                ORDER BY bytes DESC, project"""
+        ).fetchall()
+        total_sessions = sum(row[1] for row in rows)
+        total_bytes = sum(row[2] or 0 for row in rows)
+        conn.close()
+
+        print("\nProject                              Sessions       Data size")
+        print("-" * 64)
+        for project, sessions, size in rows:
+            print(f"{project[:34]:<34} {sessions:>8}   {format_bytes(size or 0):>12}")
+        print("-" * 64)
+        print(f"{'TOTAL':<34} {total_sessions:>8}   {format_bytes(total_bytes):>12}")
+        print(f"\nLogical size includes stored session, message, and part payloads.")
+        print(f"Database file size: {format_bytes(os.path.getsize(db_path))}")
+    except Exception as e:
+        print(f"[-] Database statistics error: {e}")
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Explicitly clean OpenCode history and local caches."
+    )
+
+    def add_flags(command):
+        command.add_argument(
+            "--yes",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="skip confirmation (combine with --no-pause for unattended use)",
+        )
+        command.add_argument(
+            "--no-pause",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="do not wait for Enter when finished",
+        )
+
+    add_flags(parser)
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    command_help = {
+        "clean": "quit OpenCode and run every cleanup operation",
+        "database": "clear and vacuum the SQLite database",
+        "caches": "clear prompt and session JSON caches",
+        "logs": "truncate OpenCode log files",
+        "outputs": "delete cached session diffs and tool output",
+        "stats": "show session counts and estimated data size by project",
+        "quit": "quit OpenCode without cleaning",
+    }
+
+    for name, help_text in command_help.items():
+        command = commands.add_parser(name, help=help_text)
+        add_flags(command)
+        if name in ("clean", "database"):
+            command.add_argument(
+                "--retain",
+                metavar="DURATION",
+                help="retain sessions from the last duration (for example 30d, 4w, or 5m)",
+                type=retention_argument,
+            )
+        if name in ("database", "stats"):
+            command.add_argument(
+                "--db-path",
+                help="use this SQLite database instead of the default path",
+            )
+    return parser
+
+
+def retention_argument(value):
+    try:
+        parse_retention(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return value.lower()
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command is None:
+        parser.print_help()
+        return 0
+
+    if args.command != "stats" and not getattr(args, "yes", False):
+        action = {
+            "clean": "quit OpenCode and perform every cleanup operation",
+            "database": "clear and vacuum the SQLite database",
+            "caches": "clear prompt and session JSON caches",
+            "logs": "truncate OpenCode log files",
+            "outputs": "delete cached session diffs and tool output",
+            "quit": "quit OpenCode",
+        }[args.command]
+        try:
+            answer = input(f"This will {action}. Continue? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nNo confirmation received -- cancelled.")
+            return 1
+        if answer not in ("y", "yes"):
+            print("Cancelled.")
+            return 0
+
     print_banner()
-    quit_opencode()
     app_support, db_path = get_paths()
+    if hasattr(args, "db_path") and args.db_path:
+        db_path = os.path.abspath(args.db_path)
     db_dir = os.path.dirname(db_path)
-    
-    clean_database(db_path)
-    clean_json_caches(app_support)
-    clean_logs(app_support, db_dir)
-    delete_diffs_and_outputs(db_dir)
+
+    if args.command == "stats":
+        show_stats(db_path)
+        return 0
+
+    if args.command in ("clean", "quit"):
+        quit_opencode()
+    if args.command in ("clean", "database"):
+        clean_database(db_path, getattr(args, "retain", None))
+    if args.command in ("clean", "caches"):
+        clean_json_caches(app_support)
+    if args.command in ("clean", "logs"):
+        clean_logs(app_support, db_dir)
+    if args.command in ("clean", "outputs"):
+        delete_diffs_and_outputs(db_dir)
+
     print("=" * 60)
-    print("      OpenCode history cleaned successfully!      ")
+    print("      OpenCode requested operation completed.      ")
     print("=" * 60)
-    input("\nPress Enter to exit...")
+    if not getattr(args, "no_pause", False):
+        input("\nPress Enter to exit...")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

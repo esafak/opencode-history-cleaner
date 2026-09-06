@@ -1,0 +1,4 @@
+tests/opencode.db-*
+.idea/
+__pycache__/
+*.py[cod]
