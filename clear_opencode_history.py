@@ -131,21 +131,45 @@ def clean_database(db_path, retain=None):
                         """SELECT COUNT(*) FROM event_sequence
                            WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
                     ).fetchone()[0]
-                    if _table_exists(cursor, "event"):
+                    has_event_table = _table_exists(cursor, "event")
+                    cascades_events = has_event_table and _event_sequence_cascades(cursor)
+                    if has_event_table:
                         removed_events = cursor.execute(
                             """SELECT COUNT(*) FROM event
                                WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
                         ).fetchone()[0]
+                    if has_event_table and not cascades_events:
+                        # Compatible fallback for databases created without
+                        # OpenCode's event -> event_sequence cascade.
+                        cursor.execute(
+                            """DELETE FROM event
+                               WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
+                        )
                     cursor.execute(
                         """DELETE FROM event_sequence
                            WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
                     )
+                    if has_event_table and cascades_events:
+                        remaining_events = cursor.execute(
+                            """SELECT COUNT(*) FROM event
+                               WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
+                        ).fetchone()[0]
+                        if remaining_events:
+                            raise sqlite3.IntegrityError(
+                                "event cascade did not remove all expired events"
+                            )
                     print(
                         f"[+] Removed {removed_aggregates} event aggregate(s) "
                         f"and {removed_events} event(s) for expired sessions."
                     )
                 else:
-                    print("[*] Event tables not present; event cleanup skipped.")
+                    if _table_exists(cursor, "event"):
+                        print(
+                            "[*] Event table has no event_sequence table; "
+                            "event cleanup skipped."
+                        )
+                    else:
+                        print("[*] Event tables not present; event cleanup skipped.")
 
                 cursor.execute(
                     "DELETE FROM session WHERE id IN (SELECT id FROM bygone_sessions)"
@@ -310,7 +334,13 @@ def preview_database(db_path, retain=None, command="database"):
                         "event(s) via cascade."
                     )
             else:
-                print("[*] Event tables not present; event cleanup would be skipped.")
+                if _table_exists(cursor, "event"):
+                    print(
+                        "[*] Event table has no event_sequence table; "
+                        "event cleanup would be skipped."
+                    )
+                else:
+                    print("[*] Event tables not present; event cleanup would be skipped.")
         elif retain:
             print("[-] Database does not contain a session table; retention would be skipped.")
         else:
@@ -321,10 +351,7 @@ def preview_database(db_path, retain=None, command="database"):
             for table in tables:
                 if _table_exists(cursor, table):
                     count = cursor.execute(f"SELECT COUNT(*) FROM `{table}`").fetchone()[0]
-                    print(
-                        f"[+] Would remove {format_fraction(count, count)} "
-                        f"row(s) from {table}."
-                    )
+                    print(f"[+] Would remove {count:,} row(s) from {table}.")
         conn.close()
         conn = None
         print("[*] Dry run complete; no changes were made.")
@@ -362,6 +389,16 @@ def _table_exists(cursor, table):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
     )
     return cursor.fetchone() is not None
+
+
+def _event_sequence_cascades(cursor):
+    return any(
+        row[2] == "event_sequence"
+        and row[3] == "aggregate_id"
+        and row[4] == "aggregate_id"
+        and row[6].upper() == "CASCADE"
+        for row in cursor.execute("PRAGMA foreign_key_list(event)").fetchall()
+    )
 
 def clean_json_caches(app_support):
     if not os.path.exists(app_support):
