@@ -1,0 +1,20 @@
+.github/workflows/pi-review.yml
+  h_ea91e2db23540f 90
+README.md
+  h_ea91e2db23540f 32,35,38-41,44-50,56,88,92-100,102-107
+clear_opencode_history.py
+  h_ea91e2db23540f 77,79-80,90-91,93-95,100,102-108,110-115,117-151,154-155,157-158,167,185-186,189-190,194-359,547,553,561,579-584,608-614,619,648-649
+tests/test_history_cleaner.py
+  h_ea91e2db23540f 234-250,282-318,352-387,391-396,475-534
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "725e48f4a54f2f451b0563933f091d1a2f7c11c3",
+  "prompts": {},
+  "humans": {
+    "h_ea91e2db23540f": {
+      "author": "Emre Şafak <3928300+esafak@users.noreply.github.com>"
+    }
+  }
+}
