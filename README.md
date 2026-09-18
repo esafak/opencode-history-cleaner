@@ -29,25 +29,31 @@ python3 clear_opencode_history.py
 python3 clear_opencode_history.py clean
 
 # Clean everything non-interactively
-python3 clear_opencode_history.py clean --yes --no-pause
+python3 clear_opencode_history.py clean --yes
 
 # Run one operation only
-python3 clear_opencode_history.py database --yes --no-pause
+python3 clear_opencode_history.py database --yes
 
 # Trim old sessions but retain the last 30 days
-python3 clear_opencode_history.py database --retain 30d --yes --no-pause
+python3 clear_opencode_history.py database --retain 30d --yes
+
+# Vacuum the database without deleting any data
+python3 clear_opencode_history.py vacuum --yes
 
 # The same retention option can be used with the complete cleanup
-python3 clear_opencode_history.py clean --retain 4w --yes --no-pause
-python3 clear_opencode_history.py caches --yes --no-pause
-python3 clear_opencode_history.py logs --yes --no-pause
-python3 clear_opencode_history.py outputs --yes --no-pause
+python3 clear_opencode_history.py clean --retain 4w --yes
+python3 clear_opencode_history.py caches --yes
+python3 clear_opencode_history.py logs --yes
+python3 clear_opencode_history.py outputs --yes
+
+# Preview database cleanup without changing anything
+python3 clear_opencode_history.py database --retain 30d --dry-run
 
 # Show session counts and sizes (read-only; no confirmation required)
 python3 clear_opencode_history.py stats
 
 # Test a copied database explicitly (never the default live database)
-python3 clear_opencode_history.py database --db-path /tmp/opencode-test.db --yes --no-pause
+python3 clear_opencode_history.py database --db-path /tmp/opencode-test.db --yes
 ```
 
 Use `python3 clear_opencode_history.py --help` for all commands. `quit` only
@@ -79,13 +85,23 @@ and mutate only per-test temporary copies. Run them with:
 python -m unittest discover -s tests -t .
 ```
 
-The `--db-path` option is accepted only by `database` (and `stats`) so a
+The `--db-path` option is accepted by `database`, `vacuum`, and `stats` so a
 database override cannot accidentally make `clean` operate on live cache or
 log directories.
 
-`--retain` accepts a positive number followed by `d` (days), `w` (weeks), or
+`--dry-run` is available for `database` and `clean`. It opens the database
+read-only and reports sessions and event aggregates that would be removed,
+including their fractions and percentages of the database totals.
+For safety, `clean --dry-run` previews database cleanup only; it does not
+evaluate caches, logs, or outputs. The old `--no-pause` option remains accepted
+for compatibility, but commands no longer pause after completion.
+
+The `vacuum` command only reclaims unused SQLite pages; it does not delete
+sessions or other rows. `--retain` accepts a positive number followed by `d` (days), `w` (weeks), or
 `m` (months), for example `30d`, `4w`, or `5m`. Months are treated as 30 days.
-Retention is based on the session's last-updated time and also keeps parent
-sessions needed by retained child sessions. Without `--retain`, the `database`
-operation removes all sessions as before. `clean --retain` still clears caches,
-logs, and tool outputs; retention applies only to database sessions.
+Retention is based on the session's last-updated time. Retained sessions keep
+their complete parent and child session tree, including the corresponding
+durable event history; expired session trees remove their event aggregates as
+well. Without `--retain`, the `database` operation removes all sessions and
+events as before. `clean --retain` still clears caches, logs, and tool outputs;
+retention applies only to database sessions and their event history.

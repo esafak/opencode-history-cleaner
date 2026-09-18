@@ -74,9 +74,10 @@ def clean_database(db_path, retain=None):
         return
         
     print(f"[*] Opening database at {db_path}...")
+    conn = None
     try:
-        initial_size = os.path.getsize(db_path) / (1024 * 1024)
-        print(f"[*] Initial database size: {initial_size:.2f} MB")
+        initial_size = os.path.getsize(db_path)
+        print(f"[*] Before cleanup: {format_bytes(initial_size)}")
         
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
@@ -86,37 +87,109 @@ def clean_database(db_path, retain=None):
         if retain:
             cutoff = retention_cutoff(retain)
             if _table_exists(cursor, "session"):
+                # Retain a complete session family: recent sessions, their
+                # ancestors, and all descendants of every retained session.
                 cursor.execute(
-                    """WITH RECURSIVE retained_ancestors(id) AS (
+                    """CREATE TEMP TABLE retained_sessions AS
+                       WITH RECURSIVE
+                       ancestors(id) AS (
                            SELECT id FROM session WHERE time_updated >= ?
                            UNION
                            SELECT s.parent_id
                            FROM session s
-                           JOIN retained_ancestors r ON s.id = r.id
+                           JOIN ancestors a ON s.id = a.id
                            WHERE s.parent_id IS NOT NULL
+                       ),
+                       family(id) AS (
+                           SELECT id FROM ancestors
+                           UNION
+                           SELECT s.id
+                           FROM session s
+                           JOIN family f ON s.parent_id = f.id
                        )
-                       DELETE FROM session
+                       SELECT id FROM family""",
+                    (cutoff,),
+                )
+                cursor.execute(
+                    """CREATE TEMP TABLE bygone_sessions AS
+                       SELECT id FROM session
                        WHERE time_updated < ?
-                         AND id NOT IN (SELECT id FROM retained_ancestors)""",
-                    (cutoff, cutoff),
+                         AND id NOT IN (SELECT id FROM retained_sessions)""",
+                    (cutoff,),
+                )
+                removed_sessions = cursor.execute(
+                    "SELECT COUNT(*) FROM bygone_sessions"
+                ).fetchone()[0]
+                retained_sessions = cursor.execute(
+                    "SELECT COUNT(*) FROM retained_sessions"
+                ).fetchone()[0]
+
+                removed_aggregates = 0
+                removed_events = 0
+                if _table_exists(cursor, "event_sequence"):
+                    removed_aggregates = cursor.execute(
+                        """SELECT COUNT(*) FROM event_sequence
+                           WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
+                    ).fetchone()[0]
+                    has_event_table = _table_exists(cursor, "event")
+                    cascades_events = has_event_table and _event_sequence_cascades(cursor)
+                    if has_event_table:
+                        removed_events = cursor.execute(
+                            """SELECT COUNT(*) FROM event
+                               WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
+                        ).fetchone()[0]
+                    if has_event_table and not cascades_events:
+                        # Compatible fallback for databases created without
+                        # OpenCode's event -> event_sequence cascade.
+                        cursor.execute(
+                            """DELETE FROM event
+                               WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
+                        )
+                    cursor.execute(
+                        """DELETE FROM event_sequence
+                           WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
+                    )
+                    if has_event_table and cascades_events:
+                        remaining_events = cursor.execute(
+                            """SELECT COUNT(*) FROM event
+                               WHERE aggregate_id IN (SELECT id FROM bygone_sessions)"""
+                        ).fetchone()[0]
+                        if remaining_events:
+                            raise sqlite3.IntegrityError(
+                                "event cascade did not remove all expired events"
+                            )
+                    print(
+                        f"[+] Removed {removed_aggregates} event aggregate(s) "
+                        f"and {removed_events} event(s) for expired sessions."
+                    )
+                else:
+                    if _table_exists(cursor, "event"):
+                        print(
+                            "[*] Event table has no event_sequence table; "
+                            "event cleanup skipped."
+                        )
+                    else:
+                        print("[*] Event tables not present; event cleanup skipped.")
+
+                cursor.execute(
+                    "DELETE FROM session WHERE id IN (SELECT id FROM bygone_sessions)"
                 )
                 print(
-                    f"[+] Removed sessions older than {retain} "
-                    "(months are 30 days)."
+                    f"[+] Removed {removed_sessions} expired session(s); "
+                    f"retained {retained_sessions} session(s)."
                 )
+                cursor.execute("DROP TABLE bygone_sessions")
+                cursor.execute("DROP TABLE retained_sessions")
             else:
                 print(
                     "[-] Database does not contain a session table; "
                     "retention cleanup skipped."
                 )
-            # Related rows use ON DELETE CASCADE. Global events are not tied to
-            # sessions, so leave them untouched during a retention cleanup.
             tables_to_clear = []
         else:
             tables_to_clear = [
-                "part", "message", "session_message", "session_input",
+                "event", "event_sequence", "part", "message", "session_message", "session_input",
                 "session_share", "session_context_epoch", "todo", "session",
-                "event", "event_sequence"
             ]
         
         for table in tables_to_clear:
@@ -133,11 +206,182 @@ def clean_database(db_path, retain=None):
         cursor.execute("VACUUM;")
         conn.close()
         
-        final_size = os.path.getsize(db_path) / (1024 * 1024)
-        print(f"[+] Database cleaned and optimized. Final size: {final_size:.2f} MB")
+        final_size = os.path.getsize(db_path)
+        print(f"[+] Database cleaned and optimized. After cleanup: {format_bytes(final_size)}")
         
     except Exception as e:
+        if conn is not None:
+            conn.close()
         print(f"[-] Database error: {e}")
+
+
+def format_fraction(part, total):
+    percentage = 0.0 if total == 0 else part * 100 / total
+    return f"{part:,}/{total:,} ({percentage:.1f}%)"
+
+
+def preview_database(db_path, retain=None, command="database"):
+    """Report database rows that cleanup would remove without changing the DB."""
+    if not os.path.exists(db_path):
+        print(f"[-] Database not found at {db_path}")
+        return
+
+    print(f"[*] Previewing database cleanup for {db_path} (read-only)...")
+    if command == "clean":
+        print("[*] clean --dry-run previews database cleanup only; caches, logs, and outputs are not evaluated.")
+    uri = "file:" + quote(os.path.abspath(db_path)) + "?mode=ro"
+    conn = None
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        cursor = conn.cursor()
+        if retain and _table_exists(cursor, "session"):
+            cutoff = retention_cutoff(retain)
+            cursor.execute(
+                """WITH RECURSIVE
+                   ancestors(id) AS (
+                       SELECT id FROM session WHERE time_updated >= ?
+                       UNION
+                       SELECT s.parent_id
+                       FROM session s
+                       JOIN ancestors a ON s.id = a.id
+                       WHERE s.parent_id IS NOT NULL
+                   ),
+                   family(id) AS (
+                       SELECT id FROM ancestors
+                       UNION
+                       SELECT s.id
+                       FROM session s
+                       JOIN family f ON s.parent_id = f.id
+                   )
+                   SELECT COUNT(*) FROM session
+                   WHERE time_updated < ?
+                     AND id NOT IN (SELECT id FROM family)""",
+                (cutoff, cutoff),
+            )
+            expired_sessions = cursor.fetchone()[0]
+            cursor.execute(
+                """WITH RECURSIVE
+                   ancestors(id) AS (
+                       SELECT id FROM session WHERE time_updated >= ?
+                       UNION
+                       SELECT s.parent_id
+                       FROM session s
+                       JOIN ancestors a ON s.id = a.id
+                       WHERE s.parent_id IS NOT NULL
+                   ),
+                   family(id) AS (
+                       SELECT id FROM ancestors
+                       UNION
+                       SELECT s.id
+                       FROM session s
+                       JOIN family f ON s.parent_id = f.id
+                   )
+                   SELECT COUNT(*) FROM family""",
+                (cutoff,),
+            )
+            retained_sessions = cursor.fetchone()[0]
+            total_sessions = cursor.execute("SELECT COUNT(*) FROM session").fetchone()[0]
+            session_filter = """WITH RECURSIVE
+                ancestors(id) AS (
+                    SELECT id FROM session WHERE time_updated >= ?
+                    UNION
+                    SELECT s.parent_id FROM session s
+                    JOIN ancestors a ON s.id = a.id
+                    WHERE s.parent_id IS NOT NULL
+                ),
+                family(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT s.id FROM session s
+                    JOIN family f ON s.parent_id = f.id
+                )
+                SELECT id FROM session
+                WHERE time_updated < ?
+                  AND id NOT IN (SELECT id FROM family)"""
+            params = (cutoff, cutoff)
+            print(
+                f"[+] Would retain {retained_sessions} session(s) and remove "
+                f"{format_fraction(expired_sessions, total_sessions)} expired session(s)."
+            )
+            if _table_exists(cursor, "event_sequence"):
+                total_aggregates = cursor.execute(
+                    "SELECT COUNT(*) FROM event_sequence"
+                ).fetchone()[0]
+                cursor.execute(
+                    f"""WITH expired(id) AS ({session_filter})
+                        SELECT COUNT(*) FROM event_sequence
+                        WHERE aggregate_id IN (SELECT id FROM expired)""",
+                    params,
+                )
+                removed_aggregates = cursor.fetchone()[0]
+                print(
+                    "[+] Would remove "
+                    f"{format_fraction(removed_aggregates, total_aggregates)} "
+                    "event aggregate(s)."
+                )
+                if _table_exists(cursor, "event"):
+                    total_events = cursor.execute("SELECT COUNT(*) FROM event").fetchone()[0]
+                    cursor.execute(
+                        f"""WITH expired(id) AS ({session_filter})
+                            SELECT COUNT(*) FROM event
+                            WHERE aggregate_id IN (SELECT id FROM expired)""",
+                        params,
+                    )
+                    removed_events = cursor.fetchone()[0]
+                    print(
+                        "[+] Would remove "
+                        f"{format_fraction(removed_events, total_events)} "
+                        "event(s) via cascade."
+                    )
+            else:
+                if _table_exists(cursor, "event"):
+                    print(
+                        "[*] Event table has no event_sequence table; "
+                        "event cleanup would be skipped."
+                    )
+                else:
+                    print("[*] Event tables not present; event cleanup would be skipped.")
+        elif retain:
+            print("[-] Database does not contain a session table; retention would be skipped.")
+        else:
+            tables = (
+                "event", "event_sequence", "part", "message", "session_message",
+                "session_input", "session_share", "session_context_epoch", "todo", "session",
+            )
+            for table in tables:
+                if _table_exists(cursor, table):
+                    count = cursor.execute(f"SELECT COUNT(*) FROM `{table}`").fetchone()[0]
+                    print(f"[+] Would remove {count:,} row(s) from {table}.")
+        conn.close()
+        conn = None
+        print("[*] Dry run complete; no changes were made.")
+    except Exception as e:
+        print(f"[-] Database preview error: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def vacuum_database(db_path):
+    """Reclaim unused SQLite pages without changing any rows."""
+    if not os.path.exists(db_path):
+        print(f"[-] Database not found at {db_path}")
+        return
+
+    print(f"[*] Opening database at {db_path}...")
+    try:
+        initial_size = os.path.getsize(db_path)
+        print(f"[*] Before vacuum: {format_bytes(initial_size)}")
+        conn = sqlite3.connect(db_path)
+        try:
+            print("[*] Vacuuming database without deleting data (VACUUM)...")
+            conn.execute("VACUUM;")
+        finally:
+            conn.close()
+        final_size = os.path.getsize(db_path)
+        print(f"[+] Database vacuumed. After vacuum: {format_bytes(final_size)}")
+    except Exception as e:
+        print(f"[-] Database vacuum error: {e}")
 
 
 def _table_exists(cursor, table):
@@ -145,6 +389,16 @@ def _table_exists(cursor, table):
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
     )
     return cursor.fetchone() is not None
+
+
+def _event_sequence_cascades(cursor):
+    return any(
+        row[2] == "event_sequence"
+        and row[3] == "aggregate_id"
+        and row[4] == "aggregate_id"
+        and row[6].upper() == "CASCADE"
+        for row in cursor.execute("PRAGMA foreign_key_list(event)").fetchall()
+    )
 
 def clean_json_caches(app_support):
     if not os.path.exists(app_support):
@@ -327,21 +581,21 @@ def build_parser():
             "--yes",
             action="store_true",
             default=argparse.SUPPRESS,
-            help="skip confirmation (combine with --no-pause for unattended use)",
+            help="skip confirmation",
         )
         command.add_argument(
             "--no-pause",
             action="store_true",
             default=argparse.SUPPRESS,
-            help="do not wait for Enter when finished",
+            help="accepted for compatibility; never pauses after completion",
         )
-
     add_flags(parser)
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     command_help = {
         "clean": "quit OpenCode and run every cleanup operation",
         "database": "clear and vacuum the SQLite database",
+        "vacuum": "vacuum the SQLite database without deleting data",
         "caches": "clear prompt and session JSON caches",
         "logs": "truncate OpenCode log files",
         "outputs": "delete cached session diffs and tool output",
@@ -359,7 +613,12 @@ def build_parser():
                 help="retain sessions from the last duration (for example 30d, 4w, or 5m)",
                 type=retention_argument,
             )
-        if name in ("database", "stats"):
+            command.add_argument(
+                "--dry-run",
+                action="store_true",
+                help="show what database cleanup would remove without changing anything",
+            )
+        if name in ("database", "vacuum", "stats"):
             command.add_argument(
                 "--db-path",
                 help="use this SQLite database instead of the default path",
@@ -383,10 +642,18 @@ def main(argv=None):
         parser.print_help()
         return 0
 
+    if getattr(args, "dry_run", False):
+        _, db_path = get_paths()
+        if getattr(args, "db_path", None):
+            db_path = os.path.abspath(args.db_path)
+        preview_database(db_path, getattr(args, "retain", None), args.command)
+        return 0
+
     if args.command != "stats" and not getattr(args, "yes", False):
         action = {
             "clean": "quit OpenCode and perform every cleanup operation",
             "database": "clear and vacuum the SQLite database",
+            "vacuum": "vacuum the SQLite database without deleting data",
             "caches": "clear prompt and session JSON caches",
             "logs": "truncate OpenCode log files",
             "outputs": "delete cached session diffs and tool output",
@@ -415,6 +682,8 @@ def main(argv=None):
         quit_opencode()
     if args.command in ("clean", "database"):
         clean_database(db_path, getattr(args, "retain", None))
+    if args.command == "vacuum":
+        vacuum_database(db_path)
     if args.command in ("clean", "caches"):
         clean_json_caches(app_support)
     if args.command in ("clean", "logs"):
@@ -425,8 +694,6 @@ def main(argv=None):
     print("=" * 60)
     print("      OpenCode requested operation completed.      ")
     print("=" * 60)
-    if not getattr(args, "no_pause", False):
-        input("\nPress Enter to exit...")
     return 0
 
 if __name__ == "__main__":
