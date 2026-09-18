@@ -231,6 +231,23 @@ class IsolatedDatabaseTests(unittest.TestCase):
             cleaner.clean_database(sparse, "1d")
         self.assertIn("does not contain a session table", output.getvalue())
 
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DROP TABLE event")
+        conn.execute("DROP TABLE event_sequence")
+        conn.commit()
+        conn.close()
+        with mock.patch.object(cleaner.time, "time", return_value=2_000_000):
+            cleaner.clean_database(self.db_path, "1d")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM session WHERE id='session-under-test'"
+                ).fetchone()
+            )
+        finally:
+            conn.close()
+
     def test_database_cleanup_retains_recent_sessions_and_cascades_old_history(self):
         now = 2_000_000
         retention_ms = 24 * 60 * 60 * 1000
@@ -261,6 +278,43 @@ class IsolatedDatabaseTests(unittest.TestCase):
             "(id, session_id, type, seq, time_created, time_updated, data) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             ("recent-message", "recent-session", "user", 1, 1, 1, "recent data"),
+        )
+        conn.execute(
+            "INSERT INTO session "
+            "(id, project_id, slug, directory, title, version, parent_id, "
+            "time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("old-child", "project-under-test", "old-child", "/tmp/project-under-test",
+             "Old child", "1", "recent-session", 1, 1),
+        )
+        conn.executemany(
+            "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?, ?, ?)",
+            [
+                ("session-under-test", 1, "test-owner"),
+                ("recent-session", 1, "test-owner"),
+                ("recent-child", 1, "test-owner"),
+                ("old-parent", 1, "test-owner"),
+                ("old-child", 1, "test-owner"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("event-old-session", "session-under-test", 1, "session.updated", "{}"),
+                ("event-recent-session", "recent-session", 1, "session.updated", "{}"),
+                ("event-recent-child", "recent-child", 1, "session.updated", "{}"),
+                ("event-old-parent", "old-parent", 1, "session.updated", "{}"),
+                ("event-old-child", "old-child", 1, "session.updated", "{}"),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?, ?, ?, ?, ?)",
+            (
+                "event-unrelated-json",
+                "aggregate-under-test",
+                2,
+                "audit",
+                '{"relatedSession": "session-under-test"}',
+            ),
         )
         conn.commit()
         conn.close()
@@ -295,8 +349,50 @@ class IsolatedDatabaseTests(unittest.TestCase):
                     "SELECT 1 FROM session_message WHERE id='recent-message'"
                 ).fetchone()
             )
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM event_sequence WHERE aggregate_id='session-under-test'"
+                ).fetchone()
+            )
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM event WHERE id='event-old-session'"
+                ).fetchone()
+            )
+            for session_id in ("recent-session", "recent-child", "old-parent", "old-child"):
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT 1 FROM session WHERE id=?", (session_id,)
+                    ).fetchone()
+                )
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT 1 FROM event_sequence WHERE aggregate_id=?",
+                        (session_id,),
+                    ).fetchone()
+                )
+            for event_id in (
+                "event-recent-session",
+                "event-recent-child",
+                "event-old-parent",
+                "event-old-child",
+                "event-under-test",
+                "event-unrelated-json",
+            ):
+                self.assertIsNotNone(
+                    conn.execute(
+                        "SELECT 1 FROM event WHERE id=?", (event_id,)
+                    ).fetchone()
+                )
+            self.assertEqual([], conn.execute("PRAGMA foreign_key_check").fetchall())
         finally:
             conn.close()
+
+        second_output = io.StringIO()
+        with mock.patch.object(cleaner.time, "time", return_value=now), \
+             contextlib.redirect_stdout(second_output):
+            cleaner.clean_database(self.db_path, "1d")
+        self.assertIn("Removed 0 event aggregate(s)", second_output.getvalue())
 
     def test_retention_parser_accepts_days_weeks_months_and_rejects_invalid(self):
         self.assertEqual(cleaner.parse_retention("30d"), 30 * 24 * 60 * 60 * 1000)
@@ -375,6 +471,66 @@ class IsolatedDatabaseTests(unittest.TestCase):
 
         with self.assertRaises(SystemExit):
             cleaner.build_parser().parse_args(["clean", "--db-path", self.db_path])
+
+    def test_vacuum_command_preserves_all_rows_and_uses_explicit_database(self):
+        before = self.counts(HISTORY_TABLES + PRESERVED_TABLES)
+        live_path = os.path.join(self.temp_dir.name, "live-must-not-change.db")
+        output = io.StringIO()
+        with mock.patch.object(
+            cleaner, "get_paths", return_value=(self.temp_dir.name, live_path)
+        ), contextlib.redirect_stdout(output):
+            result = cleaner.main(["vacuum", "--db-path", self.db_path, "--yes", "--no-pause"])
+        self.assertEqual(0, result)
+        self.assertFalse(os.path.exists(live_path))
+        self.assertEqual(before, self.counts(HISTORY_TABLES + PRESERVED_TABLES))
+        self.assertRegex(output.getvalue(), r"Before vacuum: \d+(?:\.\d+)? (?:B|KB|MB|GB|TB)")
+        self.assertRegex(output.getvalue(), r"After vacuum: \d+(?:\.\d+)? (?:B|KB|MB|GB|TB)")
+
+    def test_vacuum_command_requires_confirmation_and_is_in_help(self):
+        args = cleaner.build_parser().parse_args(["vacuum", "--db-path", self.db_path])
+        self.assertEqual(self.db_path, args.db_path)
+        before = self.counts(HISTORY_TABLES)
+        with mock.patch("builtins.input", return_value="no"):
+            result = cleaner.main(["vacuum", "--db-path", self.db_path])
+        self.assertEqual(0, result)
+        self.assertEqual(before, self.counts(HISTORY_TABLES))
+
+        help_output = io.StringIO()
+        with contextlib.redirect_stdout(help_output):
+            cleaner.main([])
+        self.assertIn("vacuum", help_output.getvalue())
+
+    def test_database_dry_run_is_read_only_and_skips_confirmation(self):
+        before = fixture_checksum_for(self.db_path)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = cleaner.main(["database", "--db-path", self.db_path, "--dry-run"])
+        self.assertEqual(0, result)
+        self.assertIn("Dry run complete; no changes were made", output.getvalue())
+        self.assertNotIn("Continue?", output.getvalue())
+        self.assertEqual(before, fixture_checksum_for(self.db_path))
+
+        args = cleaner.build_parser().parse_args(["database", "--dry-run"])
+        self.assertTrue(args.dry_run)
+
+        before = fixture_checksum_for(self.db_path)
+        retention_output = io.StringIO()
+        with mock.patch.object(cleaner.time, "time", return_value=2_000_000), \
+             contextlib.redirect_stdout(retention_output):
+            result = cleaner.main(["database", "--retain", "1d", "--dry-run", "--db-path", self.db_path])
+        self.assertEqual(0, result)
+        self.assertIn("and remove 1/1 (100.0%) expired session(s)", retention_output.getvalue())
+        self.assertEqual(before, fixture_checksum_for(self.db_path))
+
+        clean_output = io.StringIO()
+        with mock.patch.object(
+            cleaner, "get_paths", return_value=(self.temp_dir.name, self.db_path)
+        ), mock.patch.object(cleaner, "quit_opencode") as quit_opencode, \
+             contextlib.redirect_stdout(clean_output):
+            result = cleaner.main(["clean", "--dry-run"])
+        self.assertEqual(0, result)
+        quit_opencode.assert_not_called()
+        self.assertIn("caches, logs, and outputs are not evaluated", clean_output.getvalue())
 
     def test_confirmation_denial_does_not_clean(self):
         before = self.counts(HISTORY_TABLES)
